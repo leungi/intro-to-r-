@@ -1,0 +1,404 @@
+---
+title: "Intro to SQL in R"
+author: "Ivan Leung"
+date: "8/4/2019"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: paper
+    css: css/hideOutput.css
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(kableExtra)
+library(knitr)
+library(rmarkdown)
+library(RSQLite)
+library(DBI)
+library(dplyr)
+library(dbplyr)
+
+PrettyTable <- function(data) {
+  data %>% 
+    kable() %>% 
+    kable_styling(bootstrap_options = c("striped", "hover",
+                                        "condensed", "responsive"),
+                  full_width = FALSE)
+}
+
+#Color Format
+ColFmt <- function(x, color = 'red') {
+  outputFormat <- knitr::opts_knit$get("rmarkdown.pandoc.to")
+  if (outputFormat == "latex") {
+    paste("\\textcolor{", color, "}{", x, "}", sep = "")
+  } else if (outputFormat == "html") {
+    paste("<font color='", color, "'>", x, "</font>", sep = "")
+  } else {
+    x
+  }
+}
+
+```
+
+# Create a Database
+
+First create a database and connect to it.
+
+For this guide, a `SQLite` database will be used.
+
+```{r, eval=FALSE}
+# if the following packages are not installed yet, please install them with
+# install.packages('package_name')
+
+library(RSQLite)
+library(DBI)
+library(dplyr)
+library(dbplyr)
+```
+
+Database may be created as a temporary or permanent entity, depending on use case. For this guide, a temporary one will be used.
+
+```{r}
+con <- DBI::dbConnect(RSQLite::SQLite(), dbname = ":memory:")
+```
+
+For a permanent database, substitute the `dbname` argument with the desired path and name of the to-be-created-database.
+
+In the code below, a database called `my-db.sqlite` will be created in current working directory.
+
+```{r, eval=FALSE}
+mydb <- dbConnect(RSQLite::SQLite(), "my-db.sqlite")
+dbDisconnect(mydb)
+```
+
+In the real world, a dedicated database admin team will have created the database for users to connect to, with built-in user authentication; an example is shown below:
+
+```{r, eval=FALSE}
+real_con <- DBI::dbConnect(RSQLite::SQLite(),
+                      host = "12.34.56.78",
+                      user = rstudioapi::askForPassword("Enter username"),
+                      password = rstudioapi::askForPassword("Enter password")
+)
+```
+
+# SQL in R
+
+A database connection `con` was created above; let's load in data into it.
+
+```{r}
+dbWriteTable(con, "mtcars", mtcars)
+dbWriteTable(con, "iris", iris)
+```
+
+Check to confirm data is in database.
+
+```{r}
+dbListTables(con)
+```
+
+## Native SQL
+
+If one is familiar with SQL already, direct querying may be done.
+
+```{r}
+dbGetQuery(con, 'SELECT * FROM iris WHERE "Sepal.Length" < 4.6')
+
+dbGetQuery(con, 'SELECT distinct gear, carb FROM mtcars')
+```
+
+## `dplyr` SQL
+
+If one is not familiar with SQL (though it's highly recommend to learn `r emo::ji('smile')`), then reply on `dplyr` (with some catch...details below).
+
+The codes below are taken from the [dbplyr vignette](https://cran.r-project.org/web/packages/dbplyr/vignettes/dbplyr.html){target="_blank"}.
+
+The `copy_to()` function from `dplyr` may be used to load data into the database as well.
+
+Below, the `flights` data is loaded in.
+
+```{r}
+copy_to(con, 
+        df = nycflights13::flights, 
+        name = "flights",
+        # create table indices for faster query
+        indexes = list(
+          c("year", "month", "day"), 
+          "carrier", 
+          "tailnum",
+          "dest"
+        )
+)
+```
+
+Confirm `flights` data is in database.
+
+```{r}
+dbListTables(con)
+```
+
+### Connecting to Data Table in Database
+
+Here, we connect to the data table in the database, using `tbl()` from `dplyr`.
+
+```{r}
+flights_db <- tbl(con, "flights")
+```
+
+Note that this is a _lazy_ connection! More on this below.
+
+Notice the `[?? x 19]` in the output header for the code below.
+
+```{r}
+flights_db
+```
+
+### SQL query via `dplyr`
+
+Examples below illustrate the convenience of using `dplyr` syntax for SQL query.
+
+#### Example 1
+
+```{r}
+flights_db %>%
+  select(year:day, dep_delay, arr_delay)
+```
+
+Above is the same as running:
+
+```{r, eval=FALSE}
+dbGetQuery(con, "
+SELECT `year`, `month`, `day`, `dep_delay`, `arr_delay`
+FROM flights")
+```
+
+#### Example 2
+
+```{r}
+flights_db %>% filter(dep_delay > 240)
+```
+
+Above is the same as running:
+
+```{r, eval=FALSE}
+dbGetQuery(con, "
+SELECT *
+FROM flights
+WHERE (`dep_delay` > 240.0)")
+```
+
+#### Example 3
+
+```{r}
+flights_db %>%
+  group_by(dest) %>%
+  summarise(delay = mean(dep_time))
+```
+
+Above is the same as running:
+
+```{r, eval=FALSE}
+dbGetQuery(con, "
+SELECT `dest`, AVG(`dep_time`) AS `delay`
+FROM flights
+GROUP BY `dest`")
+```
+
+### Lazy Query
+As per `dbplyr` vignette, queries made via `dplyr` tries to be as lazy as possible:
+
+- It never pulls data into R unless you explicitly ask for it.
+
+- It delays doing any work until the last possible moment: it collects together everything you want to do and then sends it to the database in one step.
+
+This is demonstrated below.
+
+Again, notice the `[?? x 3]` in the output header for the code below.
+
+```{r}
+tailnum_delay_db <- flights_db %>% 
+  group_by(tailnum) %>%
+  summarise(
+    delay = mean(arr_delay),
+    n = n()
+  ) %>% 
+  arrange(desc(delay)) %>%
+  filter(n > 100)
+
+tailnum_delay_db
+```
+
+Lazy query has its disadvantages.
+
+Because there’s generally no way to determine how many rows a query will return unless you actually run it, `nrow()` is always `NA`.
+
+```{r, eval=FALSE}
+nrow(tailnum_delay_db)
+#> [1] NA
+```
+
+Consequently, because you can’t find the last few rows without executing the whole query, you can’t use tail()
+
+```{r, eval=FALSE}
+tail(tailnum_delay_db)
+#> Error: tail() is not supported by sql sources
+```
+
+But other database metadata that are _fixed_ may be obtained.
+
+```{r}
+colnames(tailnum_delay_db)
+```
+
+### Behind the (SQL) Scene
+
+`dplyr` kindly translated our R code to SQL equivalent, which may be inspected with `show_query()`.
+
+```{r}
+tailnum_delay_db %>% show_query()
+```
+
+Finally, data is pulled into memory via `collect()`.
+
+Notice that the output header now shows actual data dimensions - `1,201 x 3`.
+
+```{r}
+tailnum_delay <- tailnum_delay_db %>% collect()
+tailnum_delay
+```
+
+### Table Joins
+
+Joining is supported too, with a catch.
+
+In the demonstration below, the `flights` data from before is to be joined with `airlines` data via the `carrier` code column.
+
+First load the data into database.
+
+```{r}
+copy_to(con, nycflights13::airlines, "airlines")
+```
+
+Check to confirm.
+
+```{r}
+dbListTables(con)
+```
+
+Create a table connection.
+
+```{r}
+airlines_db <- tbl(con, "airlines")
+airlines_db
+```
+
+Finally, the join.
+
+```{r}
+flights_db %>% 
+  distinct(carrier) %>% 
+  left_join(airlines_db, by = "carrier")
+```
+
+Yay, it works as expected!
+
+Now the twist...
+
+In the real world, users sometimes have to blend data from different databases. To facilitate this flow of data, _database links_ are often created by database admins.
+
+Let's see an example below where the `airlines` data is now located in a different database.
+
+We'll repeat the above steps, *but* on a new temporary database, called `con2`.
+
+```{r}
+con2 <- DBI::dbConnect(RSQLite::SQLite(), ":memory:")
+copy_to(con2, nycflights13::airlines, "airlines")
+
+# check to confirm
+dbListTables(con2)
+
+# create table connection
+airlines_db2 <- tbl(con2, "airlines")
+airlines_db2
+```
+
+Now join the data tables as before.
+
+```{r, eval=FALSE}
+flights_db %>% 
+  distinct(carrier) %>% 
+  left_join(airlines_db2)
+
+#> Joining, by = "carrier"
+#> Error: `x` and `y` must share the same src, set `copy` = TRUE (may be slow)
+```
+
+It fails, for the reason noted above - these data tables sit on different databases.
+
+As a workaround, one may use the `copy` argument and set it to `TRUE`.
+
+```{r}
+flights_db %>% 
+  distinct(carrier) %>% 
+  left_join(airlines_db2, copy = TRUE)
+```
+
+Be warn that this workaround is not ideal for large data tables. In such cases, a solution implemented within the database itself (e.g., stored procedure) is recommended.
+  
+## Debugging in `dplyr` SQL
+
+There is ongoing work to translate `dplyr` syntax into SQL equivalent, but there are just cases where it's impossible.
+
+Below are some examples on how to check and improvise.
+
+First, create a fake database dataframe.
+
+```{r}
+mf <- memdb_frame(x = letters, y = seq(letters))
+```
+
+Any function that `dbplyr` doesn’t know about will be left as is
+
+```{r}
+mf %>% 
+  mutate(z = foofify(x, y)) %>% 
+  show_query()
+```
+
+Other functions are translated as a _hybrid_.
+
+In the example below, one would have used `stringr::str_detect()`, for example; however, different SQL flavours (e.g., Microsoft SQL, SQLite) handles regular expressions differently, or not handle it at all.
+
+As a workaround, such hybrid achieves the best of both worlds.
+
+```{r}
+mf %>% 
+  filter(x %LIKE% "%foo%") %>% 
+  show_query()
+```
+
+A R `paste()` equivalent in SQL (i.e. `||`).
+
+```{r}
+mf %>% 
+  transmute(z = x %||% y) %>% 
+  show_query()
+```
+
+Another flexibility of `dbplyr` is it allows mixing of `dplyr` and native SQL using `sql()`.
+
+Note that in code below, `filter()` is translated to `WHERE` in SQL, while `CAST()` stays as-is.
+
+```{r}
+mf %>% 
+  filter(y > 10) %>% 
+  transmute(factorial = sql("CAST(x AS FLOAT)")) %>% 
+  show_query()
+```
+
+Check out [translated functions]( https://cran.r-project.org/web/packages/dbplyr/vignettes/translation-function.html){target="_blank"} for a list of functions that `dbplyr` currently supports.
+
+
+
